@@ -18,6 +18,7 @@ import (
 	"v2ray.com/core/features/policy"
 	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/internet"
+	"v2ray.com/core/transport/internet/xtls"
 )
 
 // Client is a inbound handler for trojan protocol
@@ -49,7 +50,7 @@ func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
 }
 
 // Process implements OutboundHandler.Process().
-func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error { // nolint: funlen
+func (c *Client) Process(ctx context.Context, link *transport.Link, dialer internet.Dialer) error {
 	outbound := session.OutboundFromContext(ctx)
 	if outbound == nil || !outbound.Target.IsValid() {
 		return newError("target not specified")
@@ -60,7 +61,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	var server *protocol.ServerSpec
 	var conn internet.Connection
 
-	err := retry.ExponentialBackoff(5, 100).On(func() error { // nolint: gomnd
+	err := retry.ExponentialBackoff(5, 100).On(func() error {
 		server = c.serverPicker.PickServer()
 		rawConn, err := dialer.Dial(ctx, server.Destination())
 		if err != nil {
@@ -83,6 +84,45 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		return newError("user account is not valid")
 	}
 
+	iConn := conn
+	if statConn, ok := iConn.(*internet.StatCouterConnection); ok {
+		iConn = statConn.Connection
+	}
+
+	connWriter := &ConnWriter{}
+	allowUDP443 := false
+	switch account.Flow {
+	case XRO + "-udp443", XRD + "-udp443":
+		allowUDP443 = true
+		account.Flow = account.Flow[:16]
+		fallthrough
+	case XRO, XRD:
+		if destination.Address.Family().IsDomain() && destination.Address.Domain() == muxCoolAddress {
+			return newError(account.Flow + " doesn't support Mux").AtWarning()
+		}
+		if destination.Network == net.Network_UDP {
+			if !allowUDP443 && destination.Port == 443 {
+				return newError(account.Flow + " stopped UDP/443").AtInfo()
+			}
+		} else { // enable XTLS only if making TCP request
+			if xtlsConn, ok := iConn.(*xtls.Conn); ok {
+				xtlsConn.RPRX = true
+				connWriter.Flow = account.Flow
+				if account.Flow == XRD {
+					xtlsConn.DirectMode = true
+				}
+			} else {
+				return newError(`failed to use ` + account.Flow + `, maybe "security" is not "xtls"`).AtWarning()
+			}
+		}
+	case "":
+		if _, ok := iConn.(*xtls.Conn); ok {
+			panic(`To avoid misunderstanding, you must fill in Trojan "flow" when using XTLS.`)
+		}
+	default:
+		return newError("unsupported flow " + account.Flow).AtWarning()
+	}
+
 	sessionPolicy := c.policyManager.ForLevel(user.Level)
 	ctx, cancel := context.WithCancel(ctx)
 	timer := signal.CancelAfterInactivity(ctx, cancel, sessionPolicy.Timeouts.ConnectionIdle)
@@ -92,7 +132,9 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 		var bodyWriter buf.Writer
 		bufferWriter := buf.NewBufferedWriter(buf.NewWriter(conn))
-		connWriter := &ConnWriter{Writer: bufferWriter, Target: destination, Account: account}
+		connWriter.Writer = bufferWriter
+		connWriter.Target = destination
+		connWriter.Account = account
 
 		if destination.Network == net.Network_UDP {
 			bodyWriter = &PacketWriter{Writer: connWriter, Target: destination}
@@ -101,7 +143,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 		}
 
 		// write some request payload to buffer
-		if err = buf.CopyOnceTimeout(link.Reader, bodyWriter, time.Millisecond*100); err != nil && err != buf.ErrNotTimeoutReader && err != buf.ErrReadTimeout { // nolint: lll,gomnd
+		if err = buf.CopyOnceTimeout(link.Reader, bodyWriter, time.Millisecond*100); err != nil && err != buf.ErrNotTimeoutReader && err != buf.ErrReadTimeout {
 			return newError("failed to write A reqeust payload").Base(err).AtWarning()
 		}
 
@@ -140,7 +182,7 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 }
 
 func init() {
-	common.Must(common.RegisterConfig((*ClientConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) { // nolint: lll
+	common.Must(common.RegisterConfig((*ClientConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return NewClient(ctx, config.(*ClientConfig))
 	}))
 }

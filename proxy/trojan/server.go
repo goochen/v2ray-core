@@ -29,7 +29,7 @@ import (
 )
 
 func init() {
-	common.Must(common.RegisterConfig((*ServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) { // nolint: lll
+	common.Must(common.RegisterConfig((*ServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return NewServer(ctx, config.(*ServerConfig))
 	}))
 }
@@ -85,14 +85,23 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	return server, nil
 }
 
+// AddUser implements proxy.UserManager.AddUser().
+func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
+	return s.validator.Add(u)
+}
+
+// RemoveUser implements proxy.UserManager.RemoveUser().
+func (s *Server) RemoveUser(ctx context.Context, e string) error {
+	return s.validator.Del(e)
+}
+
 // Network implements proxy.Inbound.Network().
 func (s *Server) Network() []net.Network {
 	return []net.Network{net.Network_TCP}
 }
 
 // Process implements proxy.Inbound.Process().
-func (s *Server) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher routing.Dispatcher) error { // nolint: funlen,lll
-
+func (s *Server) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher routing.Dispatcher) error {
 	sid := session.ExportIDToError(ctx)
 
 	iConn := conn
@@ -125,7 +134,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn internet
 	isfb := apfb != nil
 
 	shouldFallback := false
-	if firstLen < 58 || first.Byte(56) != '\r' { // nolint: gomnd
+	if firstLen < 58 || first.Byte(56) != '\r' {
 		// invalid protocol
 		err = newError("not trojan protocol")
 		log.Record(&log.AccessMessage{
@@ -137,7 +146,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn internet
 
 		shouldFallback = true
 	} else {
-		user = s.validator.Get(hexString(first.BytesTo(56))) // nolint: gomnd
+		user = s.validator.Get(hexString(first.BytesTo(56)))
 		if user == nil {
 			// invalid user, let's fallback
 			err = newError("not a valid user")
@@ -186,6 +195,32 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn internet
 	}
 
 	// handle tcp request
+	account, ok := user.Account.(*MemoryAccount)
+	if !ok {
+		return newError("user account is not valid")
+	}
+
+	switch clientReader.Flow {
+	case XRO, XRD:
+		if account.Flow == clientReader.Flow {
+			if destination.Address.Family().IsDomain() && destination.Address.Domain() == muxCoolAddress {
+				return newError(clientReader.Flow + " doesn't support Mux").AtWarning()
+			}
+			if xtlsConn, ok := iConn.(*xtls.Conn); ok {
+				xtlsConn.RPRX = true
+				if clientReader.Flow == XRD {
+					xtlsConn.DirectMode = true
+				}
+			} else {
+				return newError(`failed to use ` + clientReader.Flow + `, maybe "security" is not "xtls"`).AtWarning()
+			}
+		} else {
+			return newError("unable to use ", clientReader.Flow).AtWarning()
+		}
+	case "":
+	default:
+		return newError("unsupported flow " + account.Flow).AtWarning()
+	}
 
 	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
 		From:   conn.RemoteAddr(),
@@ -199,7 +234,7 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn internet
 	return s.handleConnection(ctx, sessionPolicy, destination, clientReader, buf.NewWriter(conn), dispatcher)
 }
 
-func (s *Server) handleUDPPayload(ctx context.Context, clientReader *PacketReader, clientWriter *PacketWriter, dispatcher routing.Dispatcher) error { // nolint: lll
+func (s *Server) handleUDPPayload(ctx context.Context, clientReader *PacketReader, clientWriter *PacketWriter, dispatcher routing.Dispatcher) error {
 	udpServer := udp.NewDispatcher(dispatcher, func(ctx context.Context, packet *udp_proto.Packet) {
 		common.Must(clientWriter.WriteMultiBufferWithMetadata(buf.MultiBuffer{packet.Payload}, packet.Source))
 	})
@@ -277,7 +312,7 @@ func (s *Server) handleConnection(ctx context.Context, sessionPolicy policy.Sess
 	return nil
 }
 
-func (s *Server) fallback(ctx context.Context, sid errors.ExportOption, err error, sessionPolicy policy.Session, connection internet.Connection, iConn internet.Connection, apfb map[string]map[string]*Fallback, first *buf.Buffer, firstLen int64, reader buf.Reader) error { // nolint: lll
+func (s *Server) fallback(ctx context.Context, sid errors.ExportOption, err error, sessionPolicy policy.Session, connection internet.Connection, iConn internet.Connection, apfb map[string]map[string]*Fallback, first *buf.Buffer, firstLen int64, reader buf.Reader) error {
 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
 		newError("unable to set back read deadline").Base(err).AtWarning().WriteToLog(sid)
 	}
